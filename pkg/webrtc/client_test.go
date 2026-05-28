@@ -102,6 +102,35 @@ a=recvonly
 	require.Nil(t, err)
 }
 
+func TestCreateOfferCodecPreferences(t *testing.T) {
+	api, err := NewAPI()
+	require.Nil(t, err)
+
+	pc, err := api.NewPeerConnection(webrtc.Configuration{})
+	require.Nil(t, err)
+
+	prod := NewConn(pc)
+	medias := []*core.Media{
+		{
+			Kind:      core.KindVideo,
+			Direction: core.DirectionRecvonly,
+			Codecs: []*core.Codec{
+				{
+					Name:      core.CodecH264,
+					ClockRate: 90000,
+					FmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640029",
+				},
+			},
+		},
+	}
+
+	offer, err := prod.CreateOffer(medias)
+	require.Nil(t, err)
+	assert.Contains(t, offer, "profile-level-id=640029")
+	assert.Contains(t, offer, "a=rtcp-fb:")
+	assert.NotContains(t, offer, "profile-level-id=640032")
+}
+
 func TestUnmarshalICEServers(t *testing.T) {
 	s := `[{"credential":"xxx","urls":"xxx","username":"xxx"},{"credential":null,"urls":"xxx","username":null}]`
 	servers, err := UnmarshalICEServers([]byte(s))

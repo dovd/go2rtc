@@ -9,21 +9,24 @@ import (
 func (c *Conn) CreateOffer(medias []*core.Media) (string, error) {
 	// 1. Create transeivers with proper kind and direction
 	for _, media := range medias {
-		var err error
+		var (
+			err error
+			tr  *webrtc.RTPTransceiver
+		)
 		switch media.Direction {
 		case core.DirectionRecvonly:
-			_, err = c.pc.AddTransceiverFromKind(
+			tr, err = c.pc.AddTransceiverFromKind(
 				webrtc.NewRTPCodecType(media.Kind),
 				webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
 			)
 		case core.DirectionSendonly:
-			_, err = c.pc.AddTransceiverFromTrack(
+			tr, err = c.pc.AddTransceiverFromTrack(
 				NewTrack(media.Kind),
 				webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly},
 			)
 		case core.DirectionSendRecv:
 			// default transceiver is sendrecv
-			_, err = c.pc.AddTransceiverFromTrack(NewTrack(media.Kind))
+			tr, err = c.pc.AddTransceiverFromTrack(NewTrack(media.Kind))
 		default:
 			// Nest cameras require data channel
 			_, err = c.pc.CreateDataChannel(media.Kind, nil)
@@ -31,6 +34,12 @@ func (c *Conn) CreateOffer(medias []*core.Media) (string, error) {
 
 		if err != nil {
 			return "", err
+		}
+
+		if tr != nil {
+			if err = setCodecPreferences(tr, media); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -46,6 +55,52 @@ func (c *Conn) CreateOffer(medias []*core.Media) (string, error) {
 	}
 
 	return c.pc.LocalDescription().SDP, nil
+}
+
+func setCodecPreferences(tr *webrtc.RTPTransceiver, media *core.Media) error {
+	if len(media.Codecs) == 0 {
+		return nil
+	}
+
+	var custom bool
+	for _, codec := range media.Codecs {
+		if codec.FmtpLine != "" || codec.PayloadType != 0 {
+			custom = true
+			break
+		}
+	}
+	if !custom {
+		return nil
+	}
+
+	codecs := make([]webrtc.RTPCodecParameters, 0, len(media.Codecs))
+	for _, codec := range media.Codecs {
+		codecs = append(codecs, webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     MimeType(codec),
+				ClockRate:    codec.ClockRate,
+				Channels:     uint16(codec.Channels),
+				SDPFmtpLine:  codec.FmtpLine,
+				RTCPFeedback: rtcpFeedback(codec),
+			},
+			PayloadType: webrtc.PayloadType(codec.PayloadType),
+		})
+	}
+
+	return tr.SetCodecPreferences(codecs)
+}
+
+func rtcpFeedback(codec *core.Codec) []webrtc.RTCPFeedback {
+	if !codec.IsVideo() {
+		return nil
+	}
+
+	return []webrtc.RTCPFeedback{
+		{Type: "goog-remb"},
+		{Type: "ccm", Parameter: "fir"},
+		{Type: "nack"},
+		{Type: "nack", Parameter: "pli"},
+	}
 }
 
 func (c *Conn) CreateCompleteOffer(medias []*core.Media) (string, error) {

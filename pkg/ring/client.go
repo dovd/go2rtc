@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/webrtc"
 	"github.com/google/uuid"
 	pion "github.com/pion/webrtc/v4"
 )
+
+const ringH264FmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640029"
+
+var errNoVideo = errors.New("ring: negotiated session without video")
 
 type Client struct {
 	api       *RingApi
@@ -24,6 +29,23 @@ type Client struct {
 }
 
 func Dial(rawURL string) (*Client, error) {
+	var err error
+	for i := 0; i < 3; i++ {
+		var client *Client
+		client, err = dial(rawURL)
+		if err == nil {
+			return client, nil
+		}
+		if !errors.Is(err, errNoVideo) {
+			return nil, err
+		}
+		time.Sleep(time.Second)
+	}
+
+	return nil, err
+}
+
+func dial(rawURL string) (*Client, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -85,7 +107,7 @@ func Dial(rawURL string) (*Client, error) {
 			}},
 		},
 		ICETransportPolicy: pion.ICETransportPolicyAll,
-		BundlePolicy:       pion.BundlePolicyBalanced,
+		BundlePolicy:       pion.BundlePolicyMaxCompat,
 	}
 
 	api, err := webrtc.NewAPI()
@@ -187,6 +209,7 @@ func Dial(rawURL string) (*Client, error) {
 				{
 					Name:      "H264",
 					ClockRate: 90000,
+					FmtpLine:  ringH264FmtpLine,
 				},
 			},
 		},
@@ -219,7 +242,21 @@ func Dial(rawURL string) (*Client, error) {
 		return nil, err
 	}
 
+	if !hasVideoMedia(client.GetMedias()) {
+		client.Stop()
+		return nil, errNoVideo
+	}
+
 	return client, nil
+}
+
+func hasVideoMedia(medias []*core.Media) bool {
+	for _, media := range medias {
+		if media.Kind == core.KindVideo && media.Direction == core.DirectionRecvonly {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) onWSMessage(msg WSMessage) {
