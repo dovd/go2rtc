@@ -9,14 +9,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var clientCache = map[string]*RingApi{}
 var cacheMutex sync.Mutex
+var hardwareIDOnce sync.Once
+var hardwareID string
 
 type RefreshTokenAuth struct {
 	RefreshToken string
@@ -147,6 +154,7 @@ const (
 	commandsAPIBaseURL = "https://api.ring.com/commands/v1/"
 	appAPIBaseURL      = "https://prd-api-us.prd.rings.solutions/api/v1/"
 	oauthURL           = "https://oauth.ring.com/oauth/token"
+	uuidNamespace      = "e53ffdc0-e91d-4ce1-bec2-df939d94739d"
 	apiVersion         = 11
 	defaultTimeout     = 20 * time.Second
 	maxRetries         = 3
@@ -663,12 +671,12 @@ func (c *RingApi) ensureAuth() error {
 }
 
 func parseAuthConfig(refreshToken string) (*AuthConfig, error) {
-	refreshToken = strings.TrimSpace(refreshToken)
-	if refreshToken == "" {
-		return nil, fmt.Errorf("refresh token is required")
+	refreshToken, err := normalizeRefreshToken(refreshToken)
+	if err != nil {
+		return nil, err
 	}
 
-	if decoded, err := base64.StdEncoding.DecodeString(refreshToken); err == nil {
+	if decoded, err := decodeAuthConfig(refreshToken); err == nil {
 		var config AuthConfig
 		if err := json.Unmarshal(decoded, &config); err == nil && config.RT != "" {
 			if config.HID == "" {
@@ -681,15 +689,181 @@ func parseAuthConfig(refreshToken string) (*AuthConfig, error) {
 	return &AuthConfig{RT: refreshToken, HID: generateHardwareID()}, nil
 }
 
+func normalizeRefreshToken(refreshToken string) (string, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return "", fmt.Errorf("refresh token is required")
+	}
+
+	var token string
+	if err := json.Unmarshal([]byte(refreshToken), &token); err == nil {
+		refreshToken = token
+	} else {
+		jsonValue := refreshToken
+		if !strings.HasPrefix(jsonValue, "{") && strings.Contains(jsonValue, "refreshToken") {
+			jsonValue = "{" + jsonValue + "}"
+		}
+
+		var config map[string]string
+		if err := json.Unmarshal([]byte(jsonValue), &config); err == nil {
+			switch {
+			case config["refreshToken"] != "":
+				refreshToken = config["refreshToken"]
+			case config["refresh_token"] != "":
+				refreshToken = config["refresh_token"]
+			}
+		}
+	}
+
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return "", fmt.Errorf("refresh token is required")
+	}
+
+	return refreshToken, nil
+}
+
+func decodeAuthConfig(refreshToken string) ([]byte, error) {
+	encodings := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	}
+
+	var lastErr error
+	for _, encoding := range encodings {
+		decoded, err := encoding.DecodeString(refreshToken)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+	}
+
+	return nil, lastErr
+}
+
 func encodeAuthConfig(config *AuthConfig) string {
 	jsonBytes, _ := json.Marshal(config)
 	return base64.StdEncoding.EncodeToString(jsonBytes)
 }
 
 func generateHardwareID() string {
+	hardwareIDOnce.Do(func() {
+		hardwareID = detectHardwareID()
+	})
+
+	return hardwareID
+}
+
+func detectHardwareID() string {
+	if systemID := getSystemID(); systemID != "" {
+		namespace := uuid.MustParse(uuidNamespace)
+		return uuid.NewSHA1(namespace, []byte(systemID)).String()
+	}
+
 	h := sha256.New()
 	h.Write([]byte("ring-client-go2rtc"))
 	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+func getSystemID() string {
+	var systemID string
+
+	switch runtime.GOOS {
+	case "darwin":
+		systemID = getDarwinSystemID()
+	case "linux":
+		systemID = getLinuxSystemID()
+	case "windows":
+		systemID = getWindowsSystemID()
+	case "freebsd", "openbsd", "netbsd":
+		systemID = getBSDSystemID()
+	}
+
+	systemID = strings.TrimSpace(strings.ToLower(systemID))
+	if systemID == "-" || strings.Contains(systemID, "unknown") {
+		return ""
+	}
+
+	return systemID
+}
+
+func getDarwinSystemID() string {
+	if b, err := exec.Command("system_profiler", "SPHardwareDataType", "-json").Output(); err == nil {
+		var data struct {
+			Hardware []struct {
+				PlatformUUID string `json:"platform_UUID"`
+			} `json:"SPHardwareDataType"`
+		}
+		if err = json.Unmarshal(b, &data); err == nil && len(data.Hardware) > 0 {
+			if data.Hardware[0].PlatformUUID != "" {
+				return data.Hardware[0].PlatformUUID
+			}
+		}
+	}
+
+	if b, err := exec.Command("ioreg", "-rd1", "-c", "IOPlatformExpertDevice").Output(); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if !strings.Contains(line, "IOPlatformUUID") {
+				continue
+			}
+			if _, value, ok := strings.Cut(line, "="); ok {
+				return strings.Trim(value, " \t\"")
+			}
+		}
+	}
+
+	return ""
+}
+
+func getLinuxSystemID() string {
+	for _, path := range []string{"/var/lib/dbus/machine-id", "/etc/machine-id"} {
+		if b, err := os.ReadFile(path); err == nil {
+			if systemID := strings.TrimSpace(string(b)); systemID != "" {
+				return systemID
+			}
+		}
+	}
+
+	return ""
+}
+
+func getWindowsSystemID() string {
+	b, err := exec.Command("reg", "query", `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography`, "/v", "MachineGuid").Output()
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.Contains(line, "MachineGuid") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			return fields[len(fields)-1]
+		}
+	}
+
+	return ""
+}
+
+func getBSDSystemID() string {
+	b, err := exec.Command("sysctl", "-i", "kern.hostuuid").Output()
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.Contains(line, "kern.hostuuid") {
+			continue
+		}
+		if _, value, ok := strings.Cut(line, ":"); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+
+	return ""
 }
 
 func interfaceSlice(slice interface{}) []CameraData {
