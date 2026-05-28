@@ -87,7 +87,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
-		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
+		if (c.Mode == core.ModePassiveProducer || c.Mode == core.ModeActiveProducer) && remote.Kind() == webrtc.RTPCodecTypeVideo {
 			go func() {
 				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
 				for range time.NewTicker(time.Second * 2).C {
