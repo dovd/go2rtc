@@ -199,7 +199,9 @@ func NewRestClient(auth interface{}, onTokenRefresh func(string)) (*RingApi, err
 		}
 
 		client.authConfig = config
-		client.hardwareID = config.HID
+		if config.HID != "" {
+			client.hardwareID = config.HID
+		}
 		client.RefreshToken = a.RefreshToken
 	}
 
@@ -661,18 +663,22 @@ func (c *RingApi) ensureAuth() error {
 }
 
 func parseAuthConfig(refreshToken string) (*AuthConfig, error) {
-	decoded, err := base64.StdEncoding.DecodeString(refreshToken)
-	if err != nil {
-		return nil, err
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return nil, fmt.Errorf("refresh token is required")
 	}
 
-	var config AuthConfig
-	if err := json.Unmarshal(decoded, &config); err != nil {
-		// Handle legacy format where refresh token is the raw token
-		return &AuthConfig{RT: refreshToken}, nil
+	if decoded, err := base64.StdEncoding.DecodeString(refreshToken); err == nil {
+		var config AuthConfig
+		if err := json.Unmarshal(decoded, &config); err == nil && config.RT != "" {
+			if config.HID == "" {
+				config.HID = generateHardwareID()
+			}
+			return &config, nil
+		}
 	}
 
-	return &config, nil
+	return &AuthConfig{RT: refreshToken, HID: generateHardwareID()}, nil
 }
 
 func encodeAuthConfig(config *AuthConfig) string {
